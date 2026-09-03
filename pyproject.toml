@@ -1,0 +1,34 @@
+[project]
+name = "agent-ssher"
+version = "0.1.0"
+description = "Run a command on a remote server over SSH. JSON out."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "keyring>=24.0",
+]
+
+[project.scripts]
+ssher = "ssher.cli:main"
+
+# A second launcher built as a Windows GUI binary. Identical behaviour, but it
+# does not get a console allocated, so calling it from a windowed program does
+# not flash a black box on every command.
+[project.gui-scripts]
+ssherw = "ssher.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ssher"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
