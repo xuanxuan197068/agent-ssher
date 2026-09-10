@@ -261,3 +261,32 @@ def test_a_shell_without_a_c_flag_gets_one_appended():
 
 def test_there_is_no_stdin_shell_when_no_shell_is_used():
     assert ssh.stdin_shell("none") is None
+
+
+# ------------------------------------- transport failures before authentication
+
+
+def test_a_dropped_handshake_is_a_connect_failure():
+    # ssher used to report ok:true with exit 255 here, which reads as a healthy
+    # host when the connection never got as far as authentication.
+    err = ssh.diagnose(
+        255,
+        "kex_exchange_identification: read: Software caused connection abort",
+        target(),
+    )
+    assert err is not None and err.code == ssh.CONNECT_FAILED
+    assert "try again" in err.message
+
+
+def test_a_banner_exchange_failure_is_a_connect_failure():
+    err = ssh.diagnose(255, "banner exchange: Connection to 10.0.0.5 port 22: ...", target())
+    assert err.code == ssh.CONNECT_FAILED
+
+
+def test_a_reset_connection_is_a_connect_failure():
+    err = ssh.diagnose(255, "ssh: connect to host box port 22: Connection reset by peer", target())
+    assert err.code == ssh.CONNECT_FAILED
+
+
+def test_ordinary_remote_output_is_still_not_mistaken_for_a_transport_failure():
+    assert ssh.diagnose(255, "my program printed banner exchange rates", target()) is None

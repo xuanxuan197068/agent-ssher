@@ -172,34 +172,45 @@ EOF
 
 ### Why this matters, with numbers
 
-Windows PowerShell 5.1 strips double quotes out of an argument before the
-program ever sees it. A command containing `"` or `'` therefore arrives
-corrupted. Often it arrives corrupted with no error at all:
+Windows PowerShell parses your argument before ssher ever runs, and how much
+damage it does depends on how you quoted it — which is exactly the judgement an
+agent gets wrong. Two failure modes, both silent:
 
 ```bash
 ssher gpu1 "echo $HOME"
 ```
 
-prints the local Windows path, because PowerShell expanded `$HOME` first and
-then bash ate the backslashes. Exit code 0, no warning.
+Inside double quotes, PowerShell expands `$HOME` to the local Windows path
+first, and the remote shell never sees the variable. Exit code 0, no warning.
 
-A 30-case set covering every shell metacharacter was sent through each path and
-compared byte for byte against what the remote actually received:
+```bash
+ssher gpu1 "grep x $(cat f)"
+```
+
+Inside double quotes, `$(...)` is a PowerShell subexpression: it runs `cat f`
+**locally**, substitutes the result, and only then calls ssher. Your command
+reaches the server with that part replaced by local output — often empty, or a
+PowerShell error like `head : not recognized`. It can still return `ok: true`
+with a plausible but wrong result. Escaping does not save you: PowerShell's
+escape character is the backtick, not the backslash, so `\$(...)` runs anyway.
+
+A 30-case set covering every shell metacharacter, wrapped in PowerShell **single**
+quotes, was compared byte for byte against what the remote received:
 
 | Path | Result |
 | --- | --- |
-| Plain text from PowerShell 5.1 | 27 / 30 |
+| Plain text, single-quoted, from PowerShell 5.1 | 27 / 30 |
 | Plain text from Git Bash or Linux | 30 / 30 |
 | Command file | 30 / 30 |
 | Base64 | 30 / 30 |
 
-The three PowerShell failures all contained a quote character. Everything else,
-including `$` `` ` `` `$()` `&` `|` `;` `>` `#` `{}` `[]` `@()` `%` `!` `\` `*`
-`~` `^`, tabs, CJK and emoji, passes in plain text.
+The three PowerShell failures contained a `"`. Single quotes protect `$` and
+`$(...)` — but only while the command has no single quote of its own, and only
+if the agent remembers to use them. Double quotes protect nothing.
 
-**Rule of thumb.** Agent on Windows: use a command file for scripts and base64
-for one-liners. Agent on Linux or macOS: plain text is fine. Anywhere: a command
-file is never wrong.
+**Rule of thumb.** Agent on Windows: don't reason about quoting at all. Use a
+command file for anything multi-line, base64 for one-liners. Agent on Linux or
+macOS: plain text is fine. Anywhere: a command file is never wrong.
 
 ---
 

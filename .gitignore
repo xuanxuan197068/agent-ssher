@@ -24,6 +24,7 @@ env/
 .coverage.*
 htmlcov/
 coverage.xml
+lab/
 
 # --- Secrets and SSH material ---------------------------------------------
 # This project handles SSH. A private key or a known_hosts file has no business
@@ -59,6 +60,7 @@ tmp/
 *.swo
 *~
 .claude/
+.codebuddy/
 
 # --- Operating system -----------------------------------------------------
 .DS_Store

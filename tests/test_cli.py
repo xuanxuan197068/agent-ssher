@@ -275,3 +275,33 @@ def test_raw_output_falls_back_when_there_is_no_buffer():
     stream = NoBuffer()
     cli._write_through(stream, "hi")
     assert stream.text == "hi"
+
+
+# ---------------------------------------------- secrets use the canonical alias
+
+
+def test_secret_rm_uses_the_alias_spelling_from_the_ssh_config(sandbox, monkeypatch):
+    # `secret set wsl` must file the password under "WSL", because that is the
+    # name --sudo looks up. Filing it under what the user typed would leave sudo
+    # failing with nothing to explain why.
+    deleted: list[str] = []
+    monkeypatch.setattr(cli.secrets, "delete", lambda alias: deleted.append(alias) or True)
+    args = cli.build_parser().parse_args(["secret", "rm", "wsl", "--compact"])
+    cli.cmd_secret(args)
+    assert deleted == ["WSL"]
+
+
+def test_secret_set_uses_the_canonical_alias(sandbox, monkeypatch):
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "hunter2")
+    monkeypatch.setattr(cli.secrets, "set_", lambda alias, value: stored.update({alias: value}))
+    args = cli.build_parser().parse_args(["secret", "set", "wsl", "--compact"])
+    cli.cmd_secret(args)
+    assert stored == {"WSL": "hunter2"}
+
+
+def test_a_typo_host_is_refused_rather_than_filed_under_a_name_that_does_not_exist(sandbox):
+    args = cli.build_parser().parse_args(["secret", "rm", "nosuchhost", "--compact"])
+    with pytest.raises(ssh.SshError) as exc:
+        cli.cmd_secret(args)
+    assert exc.value.code == ssh.HOST_NOT_FOUND

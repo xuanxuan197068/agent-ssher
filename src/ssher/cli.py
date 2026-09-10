@@ -333,21 +333,27 @@ def cmd_secret(args) -> int:
         ]
         return finish({"ok": True, "sudo_passwords": stored, "count": len(stored)}, args)
 
+    # Store under the alias exactly as the ssh config spells it, which is the
+    # name --sudo will look up later. Without this, `secret set wsl` files the
+    # password under "wsl" while `ssher WSL --sudo` looks for "WSL", and sudo
+    # goes on failing with nothing to say why.
+    alias = ssh.resolve(args.host, cfgmod.load_config()).alias
+
     if args.secret_action == "rm":
-        removed = secrets.delete(args.host)
-        return finish({"ok": True, "host": args.host, "removed": removed}, args)
+        removed = secrets.delete(alias)
+        return finish({"ok": True, "host": alias, "removed": removed}, args)
 
     try:
-        value = getpass.getpass(f"sudo password for {args.host}: ")
+        value = getpass.getpass(f"sudo password for {alias}: ")
     except (EOFError, KeyboardInterrupt):
         return finish(error(ssh.SECRET_ERROR, "cancelled"), args)
     if not value:
         return finish(error(ssh.SECRET_ERROR, "empty value, nothing stored"), args)
     try:
-        secrets.set_(args.host, value)
+        secrets.set_(alias, value)
     except secrets.SecretError as exc:
         return finish(error(ssh.SECRET_ERROR, str(exc)), args)
-    return finish({"ok": True, "host": args.host, "stored": True}, args)
+    return finish({"ok": True, "host": alias, "stored": True}, args)
 
 
 def cmd_config(args) -> int:

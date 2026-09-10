@@ -226,6 +226,19 @@ SSH_DIAGNOSTICS = [
     (re.compile(r"Connection refused|Connection (?:timed out|closed)|No route to host|"
                 r"Network is unreachable|Operation timed out", re.I), CONNECT_FAILED,
      "the server did not accept a connection."),
+    # The server hung up before authentication even started. A busy sshd does
+    # this on purpose under MaxStartups, and so does a rate limiter, so it is
+    # usually worth simply trying again.
+    # Matched against ssh's exact phrasing, not loose keywords: a remote program
+    # is free to print the words "banner exchange" for its own reasons.
+    (re.compile(r"kex_exchange_identification:|banner exchange: Connection|"
+                r"Connection reset by (?:peer|\S+ port \d+)|"
+                r"Software caused connection abort|"
+                r"Connection closed by remote host", re.I), CONNECT_FAILED,
+     "the server dropped the connection during the SSH handshake, before "
+     "authentication. A loaded sshd does this deliberately when too many "
+     "connections are half-open, and so does a rate limiter after repeated "
+     "failures. Wait a moment and try again."),
     (re.compile(r"Bad configuration option|Bad port|line \d+: ", re.I), BAD_REQUEST,
      "ssh rejected the configuration."),
 ]
@@ -390,6 +403,19 @@ def probe(target: Target, **kwargs: Any) -> dict[str, Any]:
             token = f"__{key}__"
             if line.startswith(token):
                 fields[key] = line[len(token):].strip()
+
+    if not fields:
+        # The probe prints its markers unconditionally, so getting none of them
+        # back means the command never ran. Reporting that as a healthy host
+        # would be worse than any error.
+        raise SshError(
+            f"connected to {target.alias} but the probe produced no output "
+            f"(exit {result['exit_code']}). "
+            f"{result['stderr'].strip() or 'The server said nothing.'}",
+            CONNECT_FAILED,
+            stderr=result["stderr"].strip(),
+        )
+
     return {
         "ok": True,
         "host": target.alias,

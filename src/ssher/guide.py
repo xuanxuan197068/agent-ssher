@@ -11,13 +11,27 @@ line yourself. Always pass `--compact`.
 
 | Your command | Use |
 | --- | --- |
-| no quote characters | plain text |
-| has `'` or `"`, single line | `--b64` |
+| plain words only: no quotes, no `$`, no backticks, no `(`, no `\` | plain text |
+| single line with any of those characters | `--b64` |
 | multi-line, or a script | `--cmd-file` |
 
-On Linux and macOS plain text is always safe. On Windows PowerShell it is safe
-only without quotes, because PowerShell strips double quotes out of arguments
-before the program sees them, usually with no error.
+On Linux and macOS plain text is always safe. **On Windows PowerShell it is safe
+ONLY for plain words.** Any of `"` `'` `$` `` ` `` `$(...)` `\` in the command is
+eaten by PowerShell before ssher ever sees it, so when in doubt use `--b64` or
+`--cmd-file`.
+
+Two ways this bites, both silent:
+
+  * `"echo $HOME"` — PowerShell expands `$HOME` to the local Windows path, then
+    the remote shell never sees it. You get the wrong value, no error.
+  * `"grep x $(cat f)"` — PowerShell runs `$(cat f)` LOCALLY, substitutes the
+    result (often empty, or an error), and only then calls ssher. Your command
+    reaches the server with that part blanked out. It can even return
+    `ok: true` with a plausible-looking but wrong result.
+
+Backslash does NOT escape in PowerShell — its escape character is the backtick.
+So `\$(...)` does not protect the `$(...)`; PowerShell still runs it locally.
+Do not try to escape. Use `--b64` or `--cmd-file` and stop thinking about it.
 
 **Plain text**
 
@@ -61,7 +75,7 @@ get the output that arrived.
 
     --cwd DIR            run here; a leading ~ works
     --env NAME=VALUE     repeatable
-    --timeout SECONDS    default 60
+    --timeout SECONDS    SECONDS, not milliseconds. default 60
     --sudo               uses a stored sudo password if there is one
     --check              non-zero exit becomes ok:false
     --accept-new         record an unknown host key on first connect
@@ -70,6 +84,19 @@ get the output that arrived.
 
 Flags go before the host or right after it. After the first non-flag word,
 everything is part of the command.
+
+**`--timeout` is in SECONDS.** Not milliseconds. This is the most common
+mistake here: `--timeout 300000` is not five minutes, it is three and a half
+DAYS, and the call will block that whole time if the command hangs. Reach for:
+
+    --timeout 60       one minute (the default)
+    --timeout 600      ten minutes
+    --timeout 3600     one hour
+
+Do not set a huge timeout to "be safe" for a long job. A blocked ssher call ties
+up the connection and cannot be polled. If the work takes longer than a few
+minutes, run it detached instead (section 7) and set a normal timeout on the
+short commands that start it and check on it.
 
 ## 4. Start here on a host you have not used
 
