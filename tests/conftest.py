@@ -7,8 +7,8 @@ Host *
     ServerAliveInterval 30
 
 Host WSL
-    HostName 172.22.26.26
-    User xuan
+    HostName 10.0.0.4
+    User alice
     IdentityFile ~/.ssh/wsl
 
 Host gpu1 gpu1.alias

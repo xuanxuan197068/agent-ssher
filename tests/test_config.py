@@ -10,7 +10,7 @@ def test_ssh_config_lists_concrete_hosts_only(sandbox):
     assert set(entries) == {"WSL", "gpu1", "gpu1.alias", "bastionite"}
     assert entries["gpu1"]["hostname"] == "10.0.0.5"
     assert entries["gpu1"]["port"] == 2222
-    assert entries["WSL"]["user"] == "xuan"
+    assert entries["WSL"]["user"] == "alice"
 
 
 def test_match_block_does_not_leak_into_previous_host(sandbox):
