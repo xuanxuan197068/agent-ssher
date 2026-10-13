@@ -36,7 +36,7 @@ from typing import Any
 from . import output as outmod
 from .ssh import (
     BAD_REQUEST, CONNECT_FAILED, EXEC_FAILED, TIMEOUT,
-    SshError, Target, build_script, run_command,
+    SshError, Target, build_script, run_command, spell,
 )
 
 JOB_ROOT = "$HOME/.ssher/jobs"
@@ -67,7 +67,7 @@ def check_job_id(job_id: str) -> str:
     if not JOB_ID_RE.match(job_id) or ".." in job_id:
         raise SshError(
             f"{job_id!r} is not a job id. Job ids look like 20261013-142530-a1b2-train; "
-            f"`job list` shows them.",
+            f"{spell('job_list')} shows them.",
             BAD_REQUEST,
         )
     return job_id
@@ -199,9 +199,9 @@ echo "__PID__$(cat "$D/pid" 2>/dev/null)"
         "state": "running",
         "log_path": f"~/.ssher/jobs/{job_id}/log",
         "hint": (
-            f"started. Call job wait with job_id {job_id}; it returns as soon as the "
+            f"started. Call {spell('job_wait')} with job_id {job_id}; it returns as soon as the "
             f"job ends, or after its ceiling with state running, in which case call "
-            f"it again with since_offset set to the log_offset it returned."
+            f"it again with {spell('since')} set to the log_offset it returned."
         ),
     }
 
@@ -303,7 +303,7 @@ fi
     fields, raw_log = _fields(result["stdout"])
     if fields.get("MISSING"):
         raise SshError(
-            f"no job {job_id} on {target.alias}. `job list` shows the jobs there; "
+            f"no job {job_id} on {target.alias}. {spell('job_list')} shows the jobs there; "
             f"finished jobs are removed after {PRUNE_AFTER_DAYS} days.",
             JOB_NOT_FOUND,
         )
@@ -352,11 +352,12 @@ fi
     if skipped:
         reply["skipped_hint"] = (
             f"{skipped} bytes of new output were skipped and only the most recent "
-            f"{max_output} shown. Read the rest with: sed -n '1,200p' {reply['log_path']}"
+            f"{max_output} shown. Read them with: tail -c +{since_offset + 1} "
+            f"{reply['log_path']} | head -c {skipped}"
         )
     if state == "running":
         reply["hint"] = (
-            f"still running. Call job wait again with since_offset {size} to get "
+            f"still running. Call {spell('job_wait')} again with {spell('since')} {size} to get "
             f"only what it prints from here on."
         )
     elif state == "gone":

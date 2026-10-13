@@ -160,6 +160,19 @@ def test_a_file_survives_an_upload_and_a_download(tmp_path):
     assert back.read_bytes() == source.read_bytes()
 
 
+def test_a_remote_path_with_spaces_and_non_ascii_round_trips(tmp_path):
+    # Shell quoting that an SFTP-mode scp would take as part of the filename.
+    source = tmp_path / "local copy.txt"
+    source.write_text("第一行\n", encoding="utf-8")
+    remote = f"{REMOTE_DIR}/新 dir/a file.txt"
+    ssher("upload", HOST, str(source), remote, "--mkdir")
+    assert ssher(HOST, f"cat {REMOTE_DIR}/'新 dir/a file.txt'")["stdout"] == "第一行\n"
+
+    back = tmp_path / "back.txt"
+    ssher("download", HOST, remote, str(back))
+    assert back.read_text(encoding="utf-8") == "第一行\n"
+
+
 def test_a_directory_needs_the_recursive_flag(tmp_path):
     (tmp_path / "tree").mkdir()
     (tmp_path / "tree" / "a.txt").write_text("a", encoding="utf-8")

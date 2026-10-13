@@ -290,3 +290,76 @@ def test_a_reset_connection_is_a_connect_failure():
 
 def test_ordinary_remote_output_is_still_not_mistaken_for_a_transport_failure():
     assert ssh.diagnose(255, "my program printed banner exchange rates", target()) is None
+
+
+def test_an_unknown_host_key_names_the_mcp_parameter_when_serving_mcp(monkeypatch):
+    monkeypatch.setattr(ssh, "SPELLING", ssh.MCP_SPELLING)
+    err = ssh.diagnose(255, "Host key verification failed.", target())
+    assert "accept_new: true" in err.message and "--" not in err.message
+
+
+# ---------------------------------------------------------------- transfers
+
+
+@pytest.mark.parametrize("banner, sftp", [
+    (b"OpenSSH_10.0p2, OpenSSL 3.2.4 11 Feb 2025", True),
+    (b"OpenSSH_for_Windows_9.5p1, LibreSSL 3.8.2", True),
+    (b"OpenSSH_8.7p1, OpenSSL 1.1.1k", True),
+    (b"OpenSSH_for_Windows_8.1p1, LibreSSL 3.0.2", False),
+    (b"something else entirely", False),
+])
+def test_scp_is_told_to_use_sftp_only_where_it_can(monkeypatch, banner, sftp):
+    monkeypatch.setattr(ssh, "_scp_sftp", None)
+    monkeypatch.setattr(ssh, "_run", lambda argv, **kw: (0, b"", banner, False))
+    assert ssh.scp_uses_sftp() is sftp
+
+
+@pytest.fixture
+def scp(tmp_path, monkeypatch):
+    """Capture the scp command line a transfer would run."""
+    calls: list = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return 0, b"", b"", False
+
+    monkeypatch.setattr(ssh, "_run", fake_run)
+    source = tmp_path / "a file.txt"
+    source.write_text("x", encoding="utf-8")
+    return calls, str(source)
+
+
+def test_an_sftp_scp_gets_the_remote_path_literally(scp, monkeypatch):
+    # SFTP does not hand the path to a shell, so shell quotes would end up in
+    # the filename: ~/'my dir/新 file.txt' is not ~/my dir/新 file.txt.
+    calls, source = scp
+    monkeypatch.setattr(ssh, "_scp_sftp", True)
+    ssh.transfer(target(), direction="upload", local=source, remote="~/my dir/新 file.txt")
+    argv = calls[-1]
+    assert "-s" in argv
+    assert argv[-1] == "box:~/my dir/新 file.txt"
+
+
+def test_an_old_scp_gets_the_remote_path_shell_quoted(scp, monkeypatch):
+    calls, source = scp
+    monkeypatch.setattr(ssh, "_scp_sftp", False)
+    ssh.transfer(target(), direction="download", local=source, remote="~/my dir/f.txt")
+    argv = calls[-1]
+    assert "-s" not in argv
+    assert argv[-2] == "box:~/'my dir/f.txt'"
+
+
+def test_mkdir_still_quotes_for_the_shell_it_runs_in(scp, monkeypatch):
+    calls, source = scp
+    monkeypatch.setattr(ssh, "_scp_sftp", True)
+    made: list = []
+    monkeypatch.setattr(ssh, "run_command", lambda t, cmd, **kw: made.append(cmd))
+    ssh.transfer(target(), direction="upload", local=source,
+                 remote="~/my dir/f.txt", mkdir=True)
+    assert made == ["mkdir -p ~/'my dir'"]
+
+
+def test_a_directory_without_recursive_names_the_mcp_parameter(scp, monkeypatch, tmp_path):
+    monkeypatch.setattr(ssh, "SPELLING", ssh.MCP_SPELLING)
+    with pytest.raises(SshError, match="recursive: true"):
+        ssh.transfer(target(), direction="upload", local=str(tmp_path), remote="~/x")

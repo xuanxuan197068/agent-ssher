@@ -214,12 +214,15 @@ def run(
             connect_timeout=defaults["connect_timeout"],
             check=check,
         )
-        if used < wanted:
+        # Only worth saying when it overrides a number the agent chose; the
+        # host's own default being capped is what the hint below is for.
+        if timeout_seconds is not None and used < wanted:
             result["timeout_seconds_used"] = used
         if result.get("timed_out"):
+            asked = "asked for" if timeout_seconds is not None else "the host's timeout is"
             result["hint"] = (
                 f"stopped after {used}s"
-                + (f" (asked for {wanted}s, but one call may last at most {limit}s)"
+                + (f" ({asked} {wanted}s, but one call may last at most {limit}s)"
                    if used < wanted else "")
                 + ". Start it with job_start and collect it with job_wait instead."
             )
@@ -382,4 +385,5 @@ def job_list(host: Host) -> dict[str, Any]:
 def serve() -> None:
     # stdout carries the protocol and nothing else; anything we log goes to stderr.
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    ssh.use_spelling(ssh.MCP_SPELLING)
     server.run("stdio")

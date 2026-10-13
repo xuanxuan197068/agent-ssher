@@ -47,6 +47,40 @@ class SshError(Exception):
         self.extra = extra
 
 
+# Hints name the option or command to use next, and the two front doors spell
+# those differently: `--recursive` on the command line is `recursive` in an MCP
+# tool call. The CLI's spelling is the default; the MCP server switches to its
+# own when it starts serving.
+CLI_SPELLING = {
+    "hosts": "`ssher hosts`",
+    "recursive": "--recursive",
+    "mkdir": "--mkdir",
+    "accept_new": "--accept-new",
+    "job_wait": "`ssher job wait`",
+    "job_list": "`ssher job list`",
+    "since": "--since",
+}
+MCP_SPELLING = {
+    "hosts": "the `hosts` tool",
+    "recursive": "recursive: true",
+    "mkdir": "mkdir: true",
+    "accept_new": "accept_new: true",
+    "job_wait": "`job_wait`",
+    "job_list": "`job_list`",
+    "since": "since_offset",
+}
+SPELLING = CLI_SPELLING
+
+
+def spell(key: str) -> str:
+    return SPELLING[key]
+
+
+def use_spelling(table: dict[str, str]) -> None:
+    global SPELLING
+    SPELLING = table
+
+
 @dataclass
 class Target:
     """A host, reduced to what the ssh command line needs."""
@@ -80,7 +114,7 @@ def resolve(host: str, cfg: dict[str, Any]) -> Target:
         if not match or ("@" not in host and ":" not in host and "." not in host):
             raise SshError(
                 f"unknown host {host!r}. It is not in {cfgmod.ssh_config_path()}. "
-                f"Run `ssher hosts` to see what is available, or pass user@hostname.",
+                f"Pass user@hostname, or pick an alias; {spell('hosts')} lists them.",
                 HOST_NOT_FOUND,
             )
         port = match.group("port")
@@ -216,7 +250,7 @@ SSH_DIAGNOSTICS = [
      "known_hosts yourself."),
     (re.compile(r"Host key verification failed|No (?:RSA |ECDSA |ED25519 )?host key is known",
                 re.I), HOST_KEY_UNKNOWN,
-     "this host is not in ~/.ssh/known_hosts yet. Re-run with --accept-new to "
+     "this host is not in ~/.ssh/known_hosts yet. Re-run with {accept_new} to "
      "record its key, or connect once with plain ssh first."),
     (re.compile(r"Permission denied|Too many authentication failures", re.I), AUTH_FAILED,
      "the server rejected every key offered. ssher runs ssh in batch mode, so it "
@@ -255,6 +289,7 @@ def diagnose(returncode: int, stderr: str, target: Target) -> SshError | None:
         return None
     for pattern, code, explanation in SSH_DIAGNOSTICS:
         if pattern.search(stderr):
+            explanation = explanation.format_map(SPELLING)
             return SshError(f"{target.alias}: {explanation}", code, stderr=stderr.strip())
     return None
 
@@ -434,6 +469,31 @@ MISSING_DIR_RE = re.compile(
 )
 
 
+OPENSSH_VERSION_RE = re.compile(r"OpenSSH\S*?_(\d+)\.(\d+)")
+SCP_SFTP_SINCE = (8, 7)  # scp -s; SFTP became scp's default in 9.0
+
+_scp_sftp: bool | None = None
+
+
+def scp_uses_sftp() -> bool:
+    """Whether this machine's scp can be told to use the SFTP protocol.
+
+    The two protocols read a remote path differently. The old one hands it to
+    a shell on the server, so it needs shell quoting; SFTP takes it literally,
+    so the same quotes become part of the filename. We pass -s where it exists,
+    so the path is always taken literally, and quote only for an older scp.
+    """
+    global _scp_sftp
+    if _scp_sftp is None:
+        try:
+            _code, out, err, _timed_out = _run(["ssh", "-V"], input_=None, timeout=10)
+        except SshError:
+            out = err = b""
+        match = OPENSSH_VERSION_RE.search(outmod.decode(err + out))
+        _scp_sftp = bool(match) and (int(match[1]), int(match[2])) >= SCP_SFTP_SINCE
+    return _scp_sftp
+
+
 def transfer(
     target: Target,
     *,
@@ -448,10 +508,12 @@ def transfer(
 ) -> dict[str, Any]:
     """upload or download, via scp."""
     local_path = os.path.expanduser(local)
-    # scp hands the remote path to a remote shell, so it needs remote quoting.
-    remote_spec = f"{target.ssh_host}:{quote_path(remote)}"
+    sftp = scp_uses_sftp()
+    remote_spec = f"{target.ssh_host}:{remote if sftp else quote_path(remote)}"
 
     argv = ["scp", "-q", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}"]
+    if sftp:
+        argv.append("-s")
     if accept_new:
         argv += ["-o", "StrictHostKeyChecking=accept-new"]
     if target.port:
@@ -465,7 +527,7 @@ def transfer(
         if not os.path.exists(local_path):
             raise SshError(f"local path does not exist: {local_path}", BAD_REQUEST)
         if os.path.isdir(local_path) and not recursive:
-            raise SshError(f"{local_path} is a directory; pass --recursive", BAD_REQUEST)
+            raise SshError(f"{local_path} is a directory; pass {spell('recursive')}", BAD_REQUEST)
         if mkdir and parent:
             run_command(
                 target,
@@ -497,7 +559,7 @@ def transfer(
             # does not say which path it could not find.
             hint = (
                 f" The remote directory {parent} probably does not exist; scp will "
-                f"not create it. Re-run with --mkdir."
+                f"not create it. Re-run with {spell('mkdir')}."
             )
         raise SshError(
             f"scp failed with status {code}: {stderr or 'no message'}.{hint}",

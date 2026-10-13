@@ -105,6 +105,14 @@ def test_run_does_not_report_a_cap_it_did_not_apply(recorded, monkeypatch):
     assert "timeout_seconds_used" not in reply
 
 
+def test_run_does_not_report_capping_the_hosts_own_default(recorded, monkeypatch):
+    # The agent chose no number, so there is nothing of its to override.
+    monkeypatch.setenv(mcp_server.CALL_LIMIT_ENV, "50")
+    reply = mcp_server.run(host="gpu1", cmd="ls")
+    assert recorded["run"]["timeout"] == 45
+    assert "timeout_seconds_used" not in reply
+
+
 def test_run_sends_the_command_exactly_as_given(recorded):
     nasty = "echo \"it's $HOME\" `whoami`\ncat <<'EOF'\n你好\nEOF"
     mcp_server.run(host="gpu1", cmd=nasty)
@@ -141,3 +149,17 @@ def test_errors_come_back_in_the_same_shape_as_the_cli(sandbox):
 def test_a_bad_job_id_is_refused_without_connecting(sandbox):
     reply = mcp_server.job_wait(host="gpu1", job_id="../../etc")
     assert reply["ok"] is False and reply["error"]["code"] == ssh.BAD_REQUEST
+
+
+def test_errors_name_the_tools_not_the_cli_when_serving_mcp(sandbox, monkeypatch):
+    monkeypatch.setattr(ssh, "SPELLING", ssh.MCP_SPELLING)
+    reply = mcp_server.run(host="no-such-host", cmd="true")
+    assert "the `hosts` tool" in reply["error"]["message"]
+    assert "ssher hosts" not in reply["error"]["message"]
+
+    reply = mcp_server.job_wait(host="gpu1", job_id="../../etc")
+    assert "`job_list`" in reply["error"]["message"]
+
+
+def test_both_spellings_cover_the_same_words():
+    assert set(ssh.CLI_SPELLING) == set(ssh.MCP_SPELLING)

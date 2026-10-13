@@ -129,7 +129,14 @@ def test_wait_reports_a_running_job_and_where_to_resume(server):
     reply = jobs.wait(target(), "20261013-120000-ab12", max_wait=5)
     assert reply["state"] == "running" and reply["exit_code"] is None
     assert reply["log_offset"] == 120 and reply["output"] == "epoch 1\n"
-    assert "since_offset 120" in reply["hint"]
+    assert "--since 120" in reply["hint"]
+
+
+def test_wait_names_the_mcp_parameter_when_serving_mcp(server, monkeypatch):
+    monkeypatch.setattr(ssh, "SPELLING", ssh.MCP_SPELLING)
+    server(status_reply(state="running", size=120))
+    reply = jobs.wait(target(), "20261013-120000-ab12", max_wait=5)
+    assert "`job_wait` again with since_offset 120" in reply["hint"]
 
 
 def test_wait_reports_the_exit_code_and_run_time(server):
@@ -152,9 +159,10 @@ def test_wait_passes_the_offset_and_ceiling_to_the_server(server):
 
 def test_wait_reports_skipped_output(server):
     server(status_reply(state="exited", exit_code="0", log="tail\n", skipped=99000))
-    reply = jobs.wait(target(), "20261013-120000-ab12", max_output=300)
+    reply = jobs.wait(target(), "20261013-120000-ab12", max_output=300, since_offset=500)
     assert reply["output_skipped_bytes"] == 99000
-    assert "sed -n" in reply["skipped_hint"]
+    # The skipped bytes start where the caller asked to resume from.
+    assert "tail -c +501 ~/.ssher/jobs/20261013-120000-ab12/log | head -c 99000"         in reply["skipped_hint"]
 
 
 def test_wait_collapses_progress_bar_frames(server):
