@@ -303,6 +303,7 @@ def run_command(
     accept_new: bool = False,
     connect_timeout: int = 20,
     check: bool = False,
+    normalize: bool = True,
 ) -> dict[str, Any]:
     timeout = timeout if timeout is not None else target.timeout
 
@@ -347,8 +348,8 @@ def run_command(
     code, out, err, timed_out = _run(argv, input_=payload or None, timeout=timeout)
     duration_ms = int((time.monotonic() - started) * 1000)
 
-    stdout, out_cut = outmod.clean(out, max_output, ansi=tty)
-    stderr, err_cut = outmod.clean(err, max_output, ansi=tty)
+    stdout, out_cut = outmod.clean(out, max_output, ansi=tty, newlines=normalize)
+    stderr, err_cut = outmod.clean(err, max_output, ansi=tty, newlines=normalize)
 
     if timed_out:
         return {

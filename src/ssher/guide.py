@@ -7,6 +7,12 @@ GUIDE = r"""# ssher — run commands on remote servers
 Prints one JSON object on stdout. Use this instead of building an `ssh` command
 line yourself. Always pass `--compact`.
 
+## 0. If you have ssher's MCP tools, use those instead
+
+If your tool list includes `run`, `job_start` and `job_wait` from an `ssher`
+server, call those and skip this page. They take the command as a plain string,
+so nothing below about quoting, `--b64` or `--cmd-file` applies to them.
+
 ## 1. Pick the input form. Getting this wrong corrupts commands silently.
 
 | Your command | Use |
@@ -75,7 +81,7 @@ get the output that arrived.
 
     --cwd DIR            run here; a leading ~ works
     --env NAME=VALUE     repeatable
-    --timeout SECONDS    SECONDS, not milliseconds. default 60
+    --timeout DURATION   90, 90s, 5m or 2h. A bare number is SECONDS. default 60
     --sudo               uses a stored sudo password if there is one
     --check              non-zero exit becomes ok:false
     --accept-new         record an unknown host key on first connect
@@ -85,18 +91,15 @@ get the output that arrived.
 Flags go before the host or right after it. After the first non-flag word,
 everything is part of the command.
 
-**`--timeout` is in SECONDS.** Not milliseconds. This is the most common
-mistake here: `--timeout 300000` is not five minutes, it is three and a half
-DAYS, and the call will block that whole time if the command hangs. Reach for:
+**A bare `--timeout` number is SECONDS.** Not milliseconds. Write units and
+there is nothing to get wrong:
 
-    --timeout 60       one minute (the default)
-    --timeout 600      ten minutes
-    --timeout 3600     one hour
+    --timeout 90s
+    --timeout 10m
 
-Do not set a huge timeout to "be safe" for a long job. A blocked ssher call ties
-up the connection and cannot be polled. If the work takes longer than a few
-minutes, run it detached instead (section 7) and set a normal timeout on the
-short commands that start it and check on it.
+Anything over two hours is refused, with a note on what you probably meant:
+`--timeout 240000` is 2.8 days, not four minutes. Do not set a huge timeout to
+"be safe" for long work. Start it as a job instead (section 7).
 
 ## 4. Start here on a host you have not used
 
@@ -123,12 +126,41 @@ them in the same command, or use `--cwd` and `--env`.
 
     ssher --compact gpu1 'source ~/venv/bin/activate && python -V'
 
-## 7. There is no job system
+## 7. Long work: jobs
 
-For work longer than a timeout, start it detached and poll the log.
+Anything that may take more than a minute: start it as a job, then wait for it.
+Never poll on a timer you picked yourself.
 
-    ssher --compact gpu1 --cmd-file ./start.sh   # setsid nohup ... > ~/log 2>&1 &
-    ssher --compact gpu1 'tail -c 4000 ~/log'
+    ssher --compact job start gpu1 --name train -- python train.py
+    ssher --compact job wait gpu1 <job_id>
+
+`job start` returns a job_id at once; the job runs detached on the server and
+survives a dropped connection. It takes `--cwd`, `--env`, `--b64` and
+`--cmd-file` like a normal command.
+
+`job wait` blocks on the server and returns within a second of the job ending,
+or after `--max-wait` (default 50s) with `state: running`. Then call it again,
+passing the `log_offset` it returned so you get only what is new:
+
+    ssher --compact job wait gpu1 <job_id> --since 18234
+
+`output` is the new log, with progress-bar redraws collapsed to their last
+frame. `exit_code` is set once `state` is `exited`. Other states: `killed`, and
+`gone` (stopped without recording an exit, e.g. the server rebooted).
+
+Return early when something appears in the log, for example an error or a
+server coming up:
+
+    ssher --compact job wait gpu1 <job_id> --until 'Traceback|Error|listening on'
+
+If your harness can run a command in the background and notify you when it
+exits, use that and wait in one go; you are woken the moment the job ends:
+
+    ssher --compact job wait gpu1 <job_id> --max-wait 12h
+
+Also: `job status` (no waiting), `job list`, `job kill` (stops everything the
+job started). Logs live at `~/.ssher/jobs/<job_id>/log`; finished jobs are
+removed after seven days.
 
 ## 8. Errors
 
@@ -140,7 +172,8 @@ For work longer than a timeout, start it detached and poll the log.
     HOST_KEY_UNKNOWN    first connect; retry once with --accept-new
     HOST_KEY_MISMATCH   the key changed; report it, do not work around it
     CONNECT_FAILED      unreachable or unresolvable
-    TIMEOUT             raise --timeout, or run it detached
+    TIMEOUT             raise --timeout, or start it as a job
+    JOB_NOT_FOUND       no such job; `job list` shows what is there
     TRANSFER_FAILED     scp failed; the message has its output
     BAD_REQUEST         bad arguments, config, or base64
     NO_SSH              the OpenSSH client is not on PATH

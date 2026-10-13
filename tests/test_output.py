@@ -63,3 +63,33 @@ def test_decode_replaces_invalid_bytes():
 def test_clean_combines_the_three_steps():
     text, truncated = output.clean(b"\x1b[32mhi\x1b[0m\r\n", 1000)
     assert (text, truncated) == ("hi\n", False)
+
+
+# ------------------------------------------------- progress bars in job logs
+
+
+def test_a_progress_bar_keeps_only_its_last_frame():
+    log = "\r 10%|#         |\r 50%|#####     |\r100%|##########|\n"
+    assert output.render_terminal(log) == "100%|##########|\n"
+
+
+def test_lines_without_carriage_returns_are_untouched():
+    assert output.render_terminal("one\ntwo\n") == "one\ntwo\n"
+
+
+def test_windows_line_endings_are_not_mistaken_for_redraws():
+    assert output.render_terminal("one\r\ntwo\r\n") == "one\ntwo\n"
+
+
+def test_a_trailing_carriage_return_does_not_blank_the_line():
+    # tqdm and friends often end a frame with \r, before the next one arrives.
+    assert output.render_terminal("loss 0.31\r") == "loss 0.31"
+
+
+def test_colour_and_cursor_codes_are_removed_from_a_log():
+    assert output.render_terminal("\x1b[32mok\x1b[0m\x1b[2K\n") == "ok\n"
+
+
+def test_clean_can_leave_carriage_returns_for_later():
+    text, _ = output.clean("a\rb", 1000, ansi=False, newlines=False)
+    assert text == "a\rb"

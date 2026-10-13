@@ -14,11 +14,13 @@ import getpass
 import io
 import json
 import os
+import re
 import sys
 from typing import Any
 
 from . import __version__
 from . import config as cfgmod
+from . import jobs
 from . import secrets
 from . import ssh
 from .guide import GUIDE
@@ -28,8 +30,18 @@ EXIT_REMOTE = 1
 EXIT_ERROR = 2
 
 SUBCOMMANDS = {
-    "run", "hosts", "test", "upload", "download", "secret", "config", "agent-guide",
+    "run", "hosts", "test", "upload", "download", "job", "secret", "config",
+    "agent-guide", "mcp",
 }
+
+# Ceilings on how long one call may block. They exist to catch a unit mistake,
+# not to police anyone: an agent that writes --timeout 240000 almost always
+# meant 240000 milliseconds, and without a ceiling the call would sit there for
+# 66 hours. A real two-hour command is better off as a job anyway.
+RUN_TIMEOUT_CAP = 2 * 3600
+TRANSFER_TIMEOUT_CAP = 24 * 3600
+WAIT_CAP = 24 * 3600
+DEFAULT_WAIT = 50
 
 CONFIG_TEMPLATE = """# ssher configuration. Everything here is optional.
 #
@@ -96,7 +108,7 @@ def _write_through(stream: Any, text: str) -> None:
 
 def finish(payload: dict[str, Any], args: argparse.Namespace) -> int:
     if getattr(args, "raw", False) and payload.get("ok"):
-        _write_through(sys.stdout, payload.get("stdout", ""))
+        _write_through(sys.stdout, payload.get("stdout", payload.get("output", "")))
         if payload.get("stderr"):
             _write_through(sys.stderr, payload["stderr"])
     else:
@@ -139,16 +151,60 @@ def join_command(parts: list[str]) -> str:
     return " ".join(parts).strip()
 
 
+DURATION_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?")
+
+
+def _human(seconds: int) -> str:
+    if seconds >= 86400:
+        return f"{seconds / 86400:.1f} days"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f} hours"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f} minutes"
+    return f"{seconds} seconds"
+
+
+def parse_duration(
+    value: Any, *, flag: str, cap: int, minimum: int = 1, advice: str = ""
+) -> int:
+    """Seconds from 90, 90s, 5m, 2h or 1h30m, refusing anything past `cap`."""
+    text = str(value).strip().lower()
+    match = DURATION_RE.fullmatch(text) if text else None
+    if not match or not any(match.groups()):
+        raise ssh.SshError(
+            f"{flag} expects a duration such as 90, 90s, 5m or 2h; got {value!r}",
+            ssh.BAD_REQUEST,
+        )
+    hours, minutes, secs = (int(group) if group else 0 for group in match.groups())
+    seconds = hours * 3600 + minutes * 60 + secs
+    if seconds < minimum:
+        raise ssh.SshError(f"{flag} must be at least {minimum}s", ssh.BAD_REQUEST)
+    if seconds > cap:
+        hint = ""
+        if text.isdigit():
+            hint = (
+                f" {flag} counts seconds, not milliseconds: if you meant {text} ms, "
+                f"pass {max(1, round(seconds / 1000))}."
+            )
+        raise ssh.SshError(
+            f"{flag} {value} is {_human(seconds)}, past the {_human(cap)} limit.{hint} "
+            f"{advice}".strip(),
+            ssh.BAD_REQUEST,
+        )
+    return seconds
+
+
 # The command is collected with REMAINDER so `ssher box ls -la` needs no
 # quoting. That also swallows our own flags when they follow the host, so we
 # take them back off the front of the remainder. Scanning stops at the first
-# non-flag, which leaves a real command starting with a dash alone.
+# non-flag, which leaves a real command starting with a dash alone. Durations
+# are kept as text here and checked where their limit is known.
 TAKEBACK: dict[str, tuple[str, type | None]] = {
     "--b64": ("b64", None),
     "--cmd-file": ("cmd_file", str),
     "--cwd": ("cwd", str),
     "--env": ("env", list),
-    "--timeout": ("timeout", int),
+    "--timeout": ("timeout", str),
     "--sudo": ("sudo", None),
     "--tty": ("tty", None),
     "--shell": ("shell", str),
@@ -158,14 +214,25 @@ TAKEBACK: dict[str, tuple[str, type | None]] = {
     "--accept-new": ("accept_new", None),
 }
 
+JOB_TAKEBACK: dict[str, tuple[str, type | None]] = {
+    "--b64": ("b64", None),
+    "--cmd-file": ("cmd_file", str),
+    "--cwd": ("cwd", str),
+    "--env": ("env", list),
+    "--name": ("name", str),
+    "--accept-new": ("accept_new", None),
+}
 
-def take_back_flags(args: argparse.Namespace) -> None:
+
+def take_back_flags(
+    args: argparse.Namespace, spec: dict[str, tuple[str, type | None]] = TAKEBACK
+) -> None:
     parts = list(args.command or [])
     while parts:
         name, eq, inline = parts[0].partition("=")
-        if name not in TAKEBACK:
+        if name not in spec:
             break
-        dest, type_ = TAKEBACK[name]
+        dest, type_ = spec[name]
         parts.pop(0)
         if type_ is None:
             setattr(args, dest, True)
@@ -218,28 +285,42 @@ def read_command_file(path: str, stdin_taken: bool) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def cmd_run(args) -> int:
-    take_back_flags(args)
-    cfg = cfgmod.load_config()
-    target = ssh.resolve(args.host, cfg)
-    defaults = cfg["defaults"]
-
+def acquire_command(args: argparse.Namespace, *, stdin_taken: bool = False) -> str:
+    """The command, from the command line, --b64, or --cmd-file."""
     inline = join_command(args.command)
-    if args.cmd_file and inline:
+    cmd_file = getattr(args, "cmd_file", None)
+    if cmd_file and inline:
         raise ssh.SshError(
             f"the command came twice: --cmd-file and {inline.split()[0]!r} on the "
             f"command line. Use one.",
             ssh.BAD_REQUEST,
         )
-    if args.cmd_file:
-        raw = read_command_file(args.cmd_file, args.stdin == "-")
+    if cmd_file:
+        raw = read_command_file(cmd_file, stdin_taken)
     elif inline:
         raw = inline
     else:
         raise ssh.SshError(
             "nothing to run. Try: ssher myhost 'uname -a'", ssh.BAD_REQUEST
         )
-    command = decode_command(raw.strip() if args.b64 else raw, args.b64)
+    b64 = getattr(args, "b64", False)
+    return decode_command(raw.strip() if b64 else raw, b64)
+
+
+def cmd_run(args) -> int:
+    take_back_flags(args)
+    cfg = cfgmod.load_config()
+    target = ssh.resolve(args.host, cfg)
+    defaults = cfg["defaults"]
+
+    command = acquire_command(args, stdin_taken=args.stdin == "-")
+    timeout = None
+    if args.timeout is not None:
+        timeout = parse_duration(
+            args.timeout, flag="--timeout", cap=RUN_TIMEOUT_CAP,
+            advice="Work that long belongs in `ssher job start`, collected with "
+                   "`ssher job wait`.",
+        )
 
     stdin_text = None
     if args.stdin == "-":
@@ -253,7 +334,7 @@ def cmd_run(args) -> int:
         cwd=args.cwd,
         env=parse_env(args.env) or None,
         stdin=stdin_text,
-        timeout=args.timeout,
+        timeout=timeout,
         sudo=args.sudo,
         tty=args.tty,
         shell=args.shell or defaults["shell"],
@@ -308,6 +389,9 @@ def cmd_download(args) -> int:
 def _transfer(args, direction: str) -> int:
     cfg = cfgmod.load_config()
     target = ssh.resolve(args.host, cfg)
+    timeout = cfg["defaults"]["transfer_timeout"]
+    if args.timeout is not None:
+        timeout = parse_duration(args.timeout, flag="--timeout", cap=TRANSFER_TIMEOUT_CAP)
     return finish(
         ssh.transfer(
             target,
@@ -315,13 +399,68 @@ def _transfer(args, direction: str) -> int:
             local=args.local,
             remote=args.remote,
             recursive=args.recursive,
-            timeout=args.timeout or cfg["defaults"]["transfer_timeout"],
+            timeout=timeout,
             accept_new=args.accept_new,
             connect_timeout=cfg["defaults"]["connect_timeout"],
             mkdir=getattr(args, "mkdir", False),
         ),
         args,
     )
+
+
+def cmd_job(args) -> int:
+    cfg = cfgmod.load_config()
+    defaults = cfg["defaults"]
+    target = ssh.resolve(args.host, cfg)
+    action = args.job_action
+
+    if action == "start":
+        take_back_flags(args, JOB_TAKEBACK)
+        result = jobs.start(
+            target,
+            acquire_command(args),
+            cwd=args.cwd,
+            env=parse_env(args.env) or None,
+            name=args.name,
+            connect_timeout=defaults["connect_timeout"],
+            accept_new=args.accept_new,
+        )
+    elif action in ("wait", "status"):
+        max_wait = 0
+        if action == "wait":
+            max_wait = parse_duration(
+                args.max_wait, flag="--max-wait", cap=WAIT_CAP, minimum=0,
+                advice="To wait longer, call job wait again; nothing is lost between calls.",
+            )
+        result = jobs.wait(
+            target,
+            args.job_id,
+            max_wait=max_wait,
+            since_offset=args.since,
+            until=getattr(args, "until", None),
+            max_output=args.max_output or jobs.DEFAULT_OUTPUT_BYTES,
+            connect_timeout=defaults["connect_timeout"],
+            accept_new=args.accept_new,
+        )
+    elif action == "kill":
+        result = jobs.kill(
+            target, args.job_id,
+            connect_timeout=defaults["connect_timeout"], accept_new=args.accept_new,
+        )
+    else:
+        result = jobs.listing(
+            target, connect_timeout=defaults["connect_timeout"], accept_new=args.accept_new,
+        )
+    return finish(result, args)
+
+
+def cmd_mcp(args) -> int:
+    # Imported here, not at the top: the MCP SDK is heavy, and every ordinary
+    # `ssher host cmd` would otherwise pay for importing it.
+    from .mcp_server import serve
+
+    serve()
+    return EXIT_OK
 
 
 def cmd_secret(args) -> int:
@@ -407,7 +546,8 @@ def add_run_flags(parser: argparse.ArgumentParser) -> None:
                         help="read the command from a file, or from stdin when PATH is -")
     parser.add_argument("--cwd", help="directory to run in")
     parser.add_argument("--env", action="append", metavar="NAME=VALUE")
-    parser.add_argument("--timeout", type=int, metavar="SECONDS")
+    parser.add_argument("--timeout", metavar="DURATION",
+                        help="seconds, or 90s / 5m / 2h; default 60, at most 2h")
     parser.add_argument("--sudo", action="store_true",
                         help="run under sudo; password from the keychain if stored")
     parser.add_argument("--tty", action="store_true", help="allocate a terminal")
@@ -466,12 +606,59 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("remote")
             p.add_argument("local")
         p.add_argument("-r", "--recursive", action="store_true")
-        p.add_argument("--timeout", type=int, metavar="SECONDS")
+        p.add_argument("--timeout", metavar="DURATION",
+                       help="seconds, or 90s / 5m / 2h; default 600")
         p.add_argument("--accept-new", action="store_true")
         if name == "upload":
             p.add_argument("--mkdir", action="store_true",
                            help="create the remote parent directory first")
         p.set_defaults(func=cmd_upload if name == "upload" else cmd_download)
+
+    p = add("job", help="long-running work, detached on the server")
+    jsub = p.add_subparsers(dest="job_action", required=True)
+
+    jp = jsub.add_parser("start", parents=[common], prog="ssher job start",
+                         help="start a command detached; returns a job id at once")
+    jp.add_argument("--name", help="a label, shown in job list")
+    jp.add_argument("--cwd")
+    jp.add_argument("--env", action="append", metavar="NAME=VALUE")
+    jp.add_argument("--b64", action="store_true")
+    jp.add_argument("--cmd-file", dest="cmd_file", metavar="PATH")
+    jp.add_argument("--accept-new", action="store_true")
+    jp.add_argument("host")
+    jp.add_argument("command", nargs=argparse.REMAINDER)
+
+    for name, help_text in (
+        ("wait", "block until the job ends, --until matches, or --max-wait passes"),
+        ("status", "report on the job without waiting"),
+    ):
+        jp = jsub.add_parser(name, parents=[common], prog=f"ssher job {name}", help=help_text)
+        jp.add_argument("host")
+        jp.add_argument("job_id")
+        if name == "wait":
+            jp.add_argument("--max-wait", default=str(DEFAULT_WAIT), metavar="DURATION",
+                            help=f"seconds, or 5m / 2h; default {DEFAULT_WAIT}")
+            jp.add_argument("--until", metavar="REGEX",
+                            help="also return as soon as the new log matches this")
+        jp.add_argument("--since", type=int, default=0, metavar="OFFSET",
+                        help="only output after this log offset (the last log_offset)")
+        jp.add_argument("--max-output", type=int, dest="max_output", metavar="BYTES")
+        jp.add_argument("--accept-new", action="store_true")
+
+    jp = jsub.add_parser("kill", parents=[common], prog="ssher job kill",
+                         help="stop the job and everything it started")
+    jp.add_argument("host")
+    jp.add_argument("job_id")
+    jp.add_argument("--accept-new", action="store_true")
+
+    jp = jsub.add_parser("list", parents=[common], prog="ssher job list",
+                         help="every job on the host, newest first")
+    jp.add_argument("host")
+    jp.add_argument("--accept-new", action="store_true")
+    p.set_defaults(func=cmd_job)
+
+    p = add("mcp", help="serve ssher over MCP on stdio; started by an agent, not by you")
+    p.set_defaults(func=cmd_mcp)
 
     p = add("secret", help="store a sudo password in the OS keychain")
     ssub = p.add_subparsers(dest="secret_action", required=True)

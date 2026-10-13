@@ -21,10 +21,16 @@ ssher gpu1 'df -h /data'
 ```
 
 It exists because agents that build `ssh` command lines by hand keep hitting the
-same four walls: quoting that silently rewrites the command, output that floods
-the context window, commands that hang with no timeout, and errors that say
-nothing you can act on. It fixes those four and stops there. There is no daemon,
-no connection pool, no session state, and nothing installed on your servers.
+same walls: quoting that silently rewrites the command, output that floods the
+context window, commands that hang with no timeout, long tasks that can only be
+followed by polling on a guessed interval, and errors that say nothing you can
+act on. There is no daemon of its own, no connection pool, no session state,
+and nothing installed on your servers.
+
+It comes two ways, sharing one implementation: a command line, and an
+[MCP server](#using-it-over-mcp) for agents whose harness speaks MCP. Over MCP
+the command arrives as a plain string field, so the quoting problems below do
+not arise at all.
 
 ---
 
@@ -32,7 +38,9 @@ no connection pool, no session state, and nothing installed on your servers.
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Using it over MCP](#using-it-over-mcp)
 - [Sending a command](#sending-a-command)
+- [Long-running work: jobs](#long-running-work-jobs)
 - [Command reference](#command-reference)
 - [Output reference](#output-reference)
 - [Exit codes and error codes](#exit-codes-and-error-codes)
@@ -50,7 +58,7 @@ no connection pool, no session state, and nothing installed on your servers.
 ## Install
 
 ```bash
-uv tool install agent-ssher
+uv tool install git+https://github.com/xuanxuan197068/agent-ssher
 ```
 
 From a checkout:
@@ -91,6 +99,66 @@ If you already use `~/.ssh/config`, there is no setup at all. Whatever works
 with `ssh myhost` works with `ssher myhost`, including `IdentityFile`,
 `ProxyJump`, `Port`, `User` and your host key policy, because ssher hands the
 alias to `ssh` and lets `ssh` resolve it.
+
+---
+
+## Using it over MCP
+
+`ssher mcp` serves the same operations over MCP on stdio. You do not run it
+yourself: the agent's harness starts it when a session opens and stops it when
+the session ends. Typed at a prompt it appears to hang, because it is waiting
+for JSON-RPC on stdin.
+
+Register it once with Claude Code, for every project:
+
+```bash
+claude mcp add --scope user ssher -- ssher mcp
+```
+
+With Codex, add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.ssher]
+command = "ssher"
+args = ["mcp"]
+tool_timeout_sec = 900
+
+[mcp_servers.ssher.env]
+SSHER_MCP_CALL_LIMIT = "840"
+```
+
+Nine tools appear in the agent's tool list:
+
+| Tool | Does |
+| --- | --- |
+| `hosts` | lists every reachable host |
+| `test` | connects once, reports uname, home, shell, round trip |
+| `run` | runs a command and waits for it |
+| `upload`, `download` | copy files and directories over scp |
+| `job_start` | starts long work detached, returns a job id at once |
+| `job_wait` | blocks until the job ends, or a ceiling; returns new output |
+| `job_kill`, `job_list` | stop a job, list jobs |
+
+**Why it is better than the CLI for an agent.** The command is a JSON string, so
+no shell on this side parses it: quotes, `$VARS`, backticks, here-docs and
+newlines all arrive as written, with no `--b64` or `--cmd-file` needed. The
+timeout parameter is called `timeout_seconds`, so the unit is not a guess. The
+tools are listed with their parameters, so there is no usage page to paste
+anywhere. And each call skips starting Python.
+
+**The per-call limit.** Every MCP client cuts off a tool call that runs too
+long, and they disagree on how long that is: Codex defaults to 60 seconds,
+configurable per server as `tool_timeout_sec`, and the Claude Code desktop app
+has been reported to stop stdio calls at about 60 seconds regardless of
+settings. So no ssher tool blocks longer than `SSHER_MCP_CALL_LIMIT` seconds,
+50 by default, minus a few seconds kept back for the reply. A `run` that would
+need longer stops at the limit and says to use a job; `job_wait` returns
+`running` and is called again. For a client that allows longer calls, set the
+variable a little under its limit, as in the Codex example above, and fewer
+`job_wait` calls are needed.
+
+The CLI is unaffected and stays the right tool for people, for scripts, and for
+agents without MCP.
 
 ---
 
@@ -214,6 +282,76 @@ macOS: plain text is fine. Anywhere: a command file is never wrong.
 
 ---
 
+## Long-running work: jobs
+
+An agent's call is synchronous, so a training run or a long build cannot simply
+be a long call: it would block, hit some client's limit, and lose its output if
+the connection dropped. And polling a log on a timer means guessing an interval
+that is always either too short or too long.
+
+So long work is split in two. `job start` launches it detached on the server and
+returns at once. `job wait` blocks **on the server** and returns within a second
+of the job ending, or after a ceiling with `state: running`, in which case you
+call it again.
+
+```bash
+ssher job start gpu1 --name train -- python train.py
+```
+
+```bash
+ssher job wait gpu1 20261013-142530-a1b2-train
+```
+
+```json
+{
+  "ok": true,
+  "job_id": "20261013-142530-a1b2-train",
+  "state": "exited",
+  "exit_code": 0,
+  "elapsed_seconds": 2394,
+  "output": "epoch 40/40 loss 0.112\nsaved checkpoint\n",
+  "log_offset": 184211,
+  "output_skipped_bytes": 0,
+  "log_path": "~/.ssher/jobs/20261013-142530-a1b2-train/log"
+}
+```
+
+What makes it pleasant to follow:
+
+- **Only new output.** Pass the `log_offset` from the last call as `--since`, and
+  `output` holds only what was printed since. Nothing is repeated, so a forty
+  minute run does not burn context re-reading the same tail.
+- **Progress bars collapsed.** A tqdm-style bar redraws one line with carriage
+  returns, hundreds of times. `output` keeps only the last frame of each, the
+  way a terminal would have shown it.
+- **Return on a pattern.** `--until 'Traceback|Error|listening on'` returns as
+  soon as new output matches, even though the job is still running. A crash is
+  noticed when it happens, not when training would have finished.
+- **Bounded output.** If more than `--max-output` bytes (8 KB) are new, the most
+  recent part is returned and the rest counted in `output_skipped_bytes`.
+- **Nothing lost between calls.** A `job wait` that hits its ceiling, or whose
+  connection is dropped by a busy sshd, costs nothing: the job's state is on the
+  server's disk, and the next call carries on. A dropped handshake is retried
+  once automatically.
+
+`state` is one of `running`, `exited` (with `exit_code`), `killed`, or `gone`,
+which means it stopped without recording an exit, typically because the server
+rebooted.
+
+**Wait in one go, where the harness allows it.** Claude Code can run a command
+in the background and wake the agent when it exits. Run the wait that way with
+a long ceiling, and the agent is notified the moment the job ends, with no
+polling at all:
+
+```bash
+ssher job wait gpu1 20261013-142530-a1b2-train --max-wait 12h
+```
+
+Everything lives under `~/.ssher/jobs/<job_id>/` on the server: the script, its
+log, its pid and its exit status. Finished jobs are removed after seven days.
+
+---
+
 ## Command reference
 
 ### `ssher <host> <command>...`
@@ -222,7 +360,7 @@ Run a command. The word `run` is optional and only needed when your host is
 named the same as a subcommand.
 
 ```bash
-ssher gpu1 --cwd /srv/app --timeout 300 'make build'
+ssher gpu1 --cwd /srv/app --timeout 5m 'make build'
 ```
 
 | Flag | Meaning |
@@ -231,7 +369,7 @@ ssher gpu1 --cwd /srv/app --timeout 300 'make build'
 | `--cmd-file PATH` | read the command from a file, or from stdin when PATH is `-` |
 | `--cwd DIR` | run in this directory; a leading `~` is expanded on the server |
 | `--env NAME=VALUE` | set an environment variable; repeatable |
-| `--timeout SECONDS` | give up and kill ssh after this long; default 60 |
+| `--timeout DURATION` | give up after this long: `90`, `90s`, `5m`, `2h`; default 60s, at most 2h |
 | `--sudo` | run under sudo, using a stored password if there is one |
 | `--tty` | allocate a terminal, for the few tools that insist on one |
 | `--shell SHELL` | wrapper shell; default `bash -lc`, or `none` to skip it |
@@ -243,6 +381,13 @@ ssher gpu1 --cwd /srv/app --timeout 300 'make build'
 Flags may appear before the host or immediately after it. Once a non-flag word
 appears, everything from there on is the command, so `ssher gpu1 ls -la` works
 and `ssher gpu1 ls --cwd /srv` sends `--cwd /srv` to `ls`.
+
+A bare number is seconds. The two-hour ceiling is there to catch the commonest
+mistake an agent makes with this flag, writing milliseconds:
+
+```json
+{"ok": false, "error": {"code": "BAD_REQUEST", "message": "--timeout 240000 is 2.8 days, past the 2.0 hours limit. --timeout counts seconds, not milliseconds: if you meant 240000 ms, pass 240. Work that long belongs in `ssher job start`, collected with `ssher job wait`."}}
+```
 
 ### `ssher hosts`
 
@@ -283,7 +428,7 @@ new to you.
   "ssh_host": "WSL",
   "round_trip_ms": 343,
   "uname": "Linux box 5.15.167.4 ... x86_64 GNU/Linux",
-  "home": "/home/xuan",
+  "home": "/home/alice",
   "shell": "/bin/bash",
   "has_bash": true
 }
@@ -311,7 +456,7 @@ ssher download gpu1 /var/log/app.log ./app.log
 | --- | --- |
 | `-r`, `--recursive` | required for a directory |
 | `--mkdir` | upload only; create the remote parent directory first |
-| `--timeout SECONDS` | default 600 |
+| `--timeout DURATION` | default 600s |
 | `--accept-new` | record an unknown host key on first connect |
 
 A leading `~` in the remote path is expanded by the remote shell. Directories
@@ -321,6 +466,40 @@ scp will not create the destination's parent directory, and its own message does
 not say which path it could not find. Uploading into a directory that does not
 exist yet therefore fails with `TRANSFER_FAILED`, and the message names the
 missing directory and tells you to pass `--mkdir`.
+
+### `ssher job start|wait|status|kill|list`
+
+See [Long-running work](#long-running-work-jobs) for how they fit together.
+
+```bash
+ssher job start gpu1 --name train --cwd /srv/app -- python train.py
+```
+
+| `job start` flag | Meaning |
+| --- | --- |
+| `--name LABEL` | shown in `job list`, and folded into the job id |
+| `--cwd`, `--env` | as for a command |
+| `--b64`, `--cmd-file` | as for a command; the script is stored on the server as given |
+
+```bash
+ssher job wait gpu1 <job_id> --since 184211 --until 'Traceback' --max-wait 5m
+```
+
+| `job wait` flag | Meaning |
+| --- | --- |
+| `--max-wait DURATION` | longest to block; default 50s, at most 24h |
+| `--since OFFSET` | only output after this log offset; pass the last `log_offset` |
+| `--until REGEX` | also return as soon as new output matches; reported as `matched` |
+| `--max-output BYTES` | most new output returned, the most recent part; default 8192 |
+
+`job status <host> <job_id>` is a wait that does not wait. `job kill` stops the
+job's whole process group and records it as `killed`. `job list` shows every
+job on the host, newest first.
+
+### `ssher mcp`
+
+Serves everything above over MCP on stdio. Started by an agent's harness, not
+by hand; see [Using it over MCP](#using-it-over-mcp).
 
 ### `ssher secret set|rm|list <host>`
 
@@ -421,7 +600,8 @@ level.
 | `HOST_KEY_UNKNOWN` | first time seeing this server; re-run with `--accept-new` |
 | `HOST_KEY_MISMATCH` | the key changed; investigate, do not work around it |
 | `CONNECT_FAILED` | unreachable or unresolvable |
-| `TIMEOUT` | raise `--timeout`, or start the work detached |
+| `TIMEOUT` | raise `--timeout`, or start the work as a job |
+| `JOB_NOT_FOUND` | no such job on that host; `job list` shows what is there |
 | `EXEC_FAILED` | with `--check`, the command exited non-zero |
 | `TRANSFER_FAILED` | scp failed; the message carries its output |
 | `BAD_REQUEST` | bad arguments, bad config, bad base64 |
@@ -554,22 +734,24 @@ ssher gpu1 'cat /etc/nginx/nginx.conf'
 ssher upload gpu1 ./nginx.conf /etc/nginx/nginx.conf
 ```
 
-**Run something that outlives the connection.** There is no job system. Put the
-launcher in a file and poll the log.
+**Train a model and hear about it the moment it fails or finishes.**
 
 ```bash
-ssher gpu1 --cmd-file ./start-training.sh
+ssher job start gpu1 --name train --cwd ~/proj -- python train.py --epochs 40
 ```
 
 ```bash
-ssher gpu1 'tail -c 4000 ~/train.log'
+ssher job wait gpu1 <job_id> --until 'Traceback|CUDA out of memory'
 ```
 
-where `start-training.sh` holds:
+**Start a server and wait until it is actually up.**
 
 ```bash
-setsid nohup python train.py > ~/train.log 2>&1 < /dev/null &
-echo $!
+ssher job start gpu1 --name api -- python -m uvicorn app:app --port 8000
+```
+
+```bash
+ssher job wait gpu1 <job_id> --until 'Uvicorn running'
 ```
 
 **Use a conda environment.** Either put it in the same command:
@@ -630,6 +812,29 @@ ssher gpu1 'uptime'
   -> JSON on stdout
 ```
 
+The MCP server is a second way in to the same code. It stays up for as long as
+the agent's session, because that is how MCP works, but it is the harness that
+starts and stops it: ssher never spawns anything of its own, and nothing is left
+running when the session ends.
+
+```
+ terminal, scripts, agents without MCP        agents with MCP
+              ssher gpu1 uptime                  ssher mcp
+           (parses the command line)        (parses JSON requests)
+                        \                        /
+                         ssh.py and jobs.py: host lookup, script
+                         assembly, ssh and scp, error classification
+                                        |
+                                ssh.exe -> server
+```
+
+A job is a script written to `~/.ssher/jobs/<id>/` and launched with `setsid`,
+so it leads its own session and process group. A wrapper records its pid, its
+start and finish times, and its exit status, written atomically and last.
+`job wait` is a short loop on the server that watches for that status file, a
+dead process, or a pattern in the log, so the agent's side never has to keep
+time.
+
 Driving OpenSSH rather than importing an SSH library is both simpler and faster
 here. Importing a Python SSH library costs more time per call than the TCP
 handshake it would let you avoid, and OpenSSH already knows how to read your
@@ -656,12 +861,14 @@ uv run pytest
 ```
 
 ```bash
-SSHER_TEST_HOST=myhost uv run pytest tests/test_integration.py
+SSHER_TEST_HOST=myhost uv run pytest tests/test_integration.py tests/test_integration_jobs.py
 ```
 
 The offline tests need no network. The end-to-end tests drive the real command
-line the way an agent would, confine themselves to `~/ssher-pytest` on the
-target host, and clean up after themselves.
+line the way an agent would, and the real MCP server through the official
+client over stdio. They confine themselves to `~/ssher-pytest` and to the jobs
+they start themselves, so they are safe to point at a machine with real work on
+it.
 
 Source layout:
 

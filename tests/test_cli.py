@@ -93,9 +93,10 @@ def test_parse_env_rejects_a_bare_name():
 
 
 def test_flags_may_follow_the_host():
-    args = full_parse(["gpu1", "--cwd", "/srv", "--timeout", "5", "--", "ls"])
+    args = full_parse(["gpu1", "--cwd", "/srv", "--timeout", "5m", "--", "ls"])
     cli.take_back_flags(args)
-    assert args.cwd == "/srv" and args.timeout == 5
+    # Durations stay text until the command knows which limit applies.
+    assert args.cwd == "/srv" and args.timeout == "5m"
     assert cli.join_command(args.command) == "ls"
 
 
@@ -132,9 +133,92 @@ def test_a_missing_flag_value_is_reported():
 
 
 def test_a_non_numeric_timeout_is_reported():
-    args = full_parse(["gpu1", "--timeout", "soon", "ls"])
-    with pytest.raises(ssh.SshError, match="number"):
-        cli.take_back_flags(args)
+    with pytest.raises(ssh.SshError, match="duration"):
+        cli.parse_duration("soon", flag="--timeout", cap=7200)
+
+
+# ------------------------------------------------------------------ durations
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("90", 90), ("90s", 90), ("5m", 300), ("2h", 7200), ("1h30m", 5400),
+    ("1h0m5s", 3605), (" 45 ", 45), ("10M", 600),
+])
+def test_durations_parse(text, seconds):
+    assert cli.parse_duration(text, flag="--timeout", cap=86400) == seconds
+
+
+def test_a_duration_past_the_cap_is_refused():
+    with pytest.raises(ssh.SshError, match="past the"):
+        cli.parse_duration("3h", flag="--timeout", cap=7200)
+
+
+def test_the_milliseconds_mistake_is_named_with_the_value_meant():
+    # 240000 is what an agent writes when it means four minutes in milliseconds.
+    with pytest.raises(ssh.SshError) as exc:
+        cli.parse_duration("240000", flag="--timeout", cap=7200)
+    assert "not milliseconds" in exc.value.message
+    assert "pass 240" in exc.value.message
+
+
+def test_the_milliseconds_hint_is_not_offered_for_a_value_with_units():
+    with pytest.raises(ssh.SshError) as exc:
+        cli.parse_duration("3h", flag="--timeout", cap=7200)
+    assert "milliseconds" not in exc.value.message
+
+
+def test_zero_is_refused_where_a_minimum_applies():
+    with pytest.raises(ssh.SshError, match="at least"):
+        cli.parse_duration("0", flag="--timeout", cap=7200)
+
+
+def test_zero_is_allowed_where_it_means_do_not_wait():
+    assert cli.parse_duration("0", flag="--max-wait", cap=86400, minimum=0) == 0
+
+
+@pytest.mark.parametrize("bad", ["", "m", "5 m", "-5", "1.5h", "5d"])
+def test_malformed_durations_are_refused(bad):
+    with pytest.raises(ssh.SshError, match="duration"):
+        cli.parse_duration(bad, flag="--timeout", cap=86400)
+
+
+# ------------------------------------------------------------------ job verbs
+
+
+def test_job_is_a_subcommand_not_a_host():
+    args = full_parse(["job", "list", "gpu1"])
+    assert args.func is cli.cmd_job and args.job_action == "list"
+
+
+def test_job_start_takes_its_flags_after_the_host():
+    args = full_parse(["job", "start", "gpu1", "--name", "train", "--cwd", "/srv",
+                       "--", "python", "train.py"])
+    cli.take_back_flags(args, cli.JOB_TAKEBACK)
+    assert args.name == "train" and args.cwd == "/srv"
+    assert cli.join_command(args.command) == "python train.py"
+
+
+def test_job_start_reads_a_command_file(tmp_path):
+    script = tmp_path / "train.sh"
+    script.write_text("echo one\necho two\n", encoding="utf-8")
+    args = full_parse(["job", "start", "gpu1", "--cmd-file", str(script)])
+    cli.take_back_flags(args, cli.JOB_TAKEBACK)
+    assert cli.acquire_command(args) == "echo one\necho two\n"
+
+
+def test_job_wait_defaults_to_a_short_bounded_wait():
+    args = full_parse(["job", "wait", "gpu1", "20261013-120000-ab12"])
+    assert args.max_wait == str(cli.DEFAULT_WAIT) and args.since == 0
+
+
+def test_job_wait_carries_the_offset_and_pattern():
+    args = full_parse(["job", "wait", "gpu1", "20261013-120000-ab12",
+                       "--since", "4096", "--until", "Traceback|Error", "--max-wait", "12h"])
+    assert args.since == 4096 and args.until == "Traceback|Error" and args.max_wait == "12h"
+
+
+def test_mcp_is_a_subcommand():
+    assert full_parse(["mcp"]).func is cli.cmd_mcp
 
 
 def test_global_flags_work_on_either_side_of_the_subcommand():
